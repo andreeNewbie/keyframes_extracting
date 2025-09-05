@@ -147,7 +147,7 @@ class TransNetV2Torch:
     @staticmethod
     def save_keyframes_to_folder(video_path: str, keyframe_indices, output_dir):
         """
-        Extract keyframes and save to specific folder with 720p resolution scaling
+        Extract keyframes using optimized flow: pre-process video to 720p, then extract keyframes
         
         Args:
             video_path: Path to original video
@@ -155,97 +155,121 @@ class TransNetV2Torch:
             output_dir: Directory to save keyframes
             
         Note:
-            - Keyframes are automatically scaled to 720p while maintaining aspect ratio
+            - Video is pre-processed to 720p once, then keyframes are extracted from processed video
+            - Much faster than scaling individual frames
             - Output format: JPG files named as frame_index (e.g., 000123.jpg)
         """
         import os
+        import tempfile
         
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
         
-        print(f"[TransNetV2] Extracting {len(keyframe_indices)} keyframes to {output_dir}")
+        print(f"[TransNetV2] Processing {len(keyframe_indices)} keyframes from {os.path.basename(video_path)}")
         
-        # Get video info first to determine total frames and FPS
+        # Get video info for FPS and frame validation
         try:
             probe = ffmpeg.probe(video_path)
             video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
-            original_width = int(video_info['width'])
-            original_height = int(video_info['height'])
-            
-            # Calculate target resolution (720p scaling)
-            target_width, target_height, needs_scaling = TransNetV2Torch.calculate_720p_resolution(
-                original_width, original_height
-            )
-            
-            # Calculate total frames
             fps = eval(video_info['r_frame_rate'])  # Convert "25/1" to 25.0
             duration = float(video_info['duration'])
             total_frames = int(fps * duration)
-            
-            if needs_scaling:
-                print(f"[TransNetV2] Video info: {original_width}x{original_height} → {target_width}x{target_height}, {fps:.2f} FPS, {total_frames} frames")
-            else:
-                print(f"[TransNetV2] Video info: {original_width}x{original_height} (no scaling needed), {fps:.2f} FPS, {total_frames} frames")
             
         except Exception as e:
             print(f"Error getting video info: {e}")
             fps = 25.0  # Default FPS
             total_frames = None
-            target_width, target_height = 1280, 720  # Default 720p
-            needs_scaling = True  # Assume scaling is needed by default
+        
+        # Validate keyframe indices
+        valid_keyframes = []
+        for frame_idx in keyframe_indices:
+            if total_frames and frame_idx >= total_frames:
+                print(f"[Warning] Frame {frame_idx} exceeds video length ({total_frames} frames), skipping")
+                continue
+            valid_keyframes.append(frame_idx)
+        
+        if not valid_keyframes:
+            print("[Warning] No valid keyframes to extract")
+            return
+        
+        # Create temporary file for 720p video
+        temp_dir = tempfile.mkdtemp()
+        temp_video_path = os.path.join(temp_dir, "temp_720p.mp4")
+        
+        try:
+            # Step 1: Pre-process video to 720p
+            processed_video_path, target_width, target_height, was_processed = TransNetV2Torch.preprocess_video_to_720p(
+                video_path, temp_video_path
+            )
+            
+            # Step 2: Extract keyframes from processed video
+            TransNetV2Torch.extract_keyframes_from_preprocessed_video(
+                processed_video_path, valid_keyframes, output_dir, fps, target_width, target_height
+            )
+            
+            print(f"[TransNetV2] Completed! Keyframes saved to {output_dir}")
+            
+        finally:
+            # Clean up temporary files
+            try:
+                if os.path.exists(temp_video_path):
+                    os.remove(temp_video_path)
+                os.rmdir(temp_dir)
+            except:
+                pass  # Ignore cleanup errors
+
+    @staticmethod
+    def extract_keyframes_from_preprocessed_video(video_path: str, keyframe_indices, output_dir, fps, target_width, target_height):
+        """
+        Extract keyframes from pre-processed 720p video (much faster)
+        
+        Args:
+            video_path: Path to pre-processed video
+            keyframe_indices: List of frame indices to extract
+            output_dir: Directory to save keyframes
+            fps: Video FPS
+            target_width: Video width
+            target_height: Video height
+        """
+        import os
+        from PIL import Image
+        
+        print(f"[TransNetV2] Extracting {len(keyframe_indices)} keyframes from pre-processed video")
         
         for i, frame_idx in enumerate(keyframe_indices):
             try:
-                # Check if frame index is valid
-                if total_frames and frame_idx >= total_frames:
-                    print(f"\n[Warning] Frame {frame_idx} exceeds video length ({total_frames} frames), skipping")
-                    continue
-                
                 # Calculate timestamp
                 timestamp = frame_idx / fps
                 
-                # Extract single frame with conditional scaling for optimal performance
-                if needs_scaling:
-                    # Scale down to 720p using fast bilinear interpolation
-                    video_stream, _ = ffmpeg.input(video_path, ss=timestamp).output(
-                        "pipe:", 
-                        vframes=1, 
-                        format="rawvideo", 
-                        pix_fmt="rgb24",
-                        s=f"{target_width}x{target_height}",
-                        sws_flags="bilinear"  # Fast scaling algorithm
-                    ).run(capture_stdout=True, capture_stderr=True, quiet=True)
-                else:
-                    # Extract at original resolution (no scaling needed)
-                    video_stream, _ = ffmpeg.input(video_path, ss=timestamp).output(
-                        "pipe:", 
-                        vframes=1, 
-                        format="rawvideo", 
-                        pix_fmt="rgb24"
-                    ).run(capture_stdout=True, capture_stderr=True, quiet=True)
+                # Extract frame at original resolution (no additional scaling needed)
+                video_stream, _ = ffmpeg.input(video_path, ss=timestamp).output(
+                    "pipe:", 
+                    vframes=1, 
+                    format="rawvideo", 
+                    pix_fmt="rgb24"
+                ).run(capture_stdout=True, capture_stderr=True, quiet=True)
                 
                 # Check if we got data
                 if len(video_stream) == 0:
                     print(f"\n[Warning] No data for frame {frame_idx} at timestamp {timestamp:.2f}s, skipping")
                     continue
                 
-                # Calculate expected size for target resolution
+                # Calculate expected size
                 expected_size = target_width * target_height * 3
                 if len(video_stream) != expected_size:
                     print(f"\n[Warning] Frame {frame_idx}: expected {expected_size} bytes, got {len(video_stream)}, skipping")
                     continue
                 
-                # Reshape frame using target resolution
+                # Reshape frame
                 frame_array = np.frombuffer(video_stream, np.uint8).reshape([target_height, target_width, 3])
                 
                 # Convert to PIL Image and save as JPG
-                from PIL import Image
                 img = Image.fromarray(frame_array)
                 
                 # Generate filename: <frame_idx>.jpg
                 filename = f"{frame_idx:06d}.jpg"
                 filepath = os.path.join(output_dir, filename)
-                img.save(filepath, 'JPEG', quality=95, optimize=True)
+                img.save(filepath, 'JPEG', quality=90, optimize=True)
                 
                 print(f"\r[TransNetV2] Saved: {filename} ({i+1}/{len(keyframe_indices)})", end="")
                 
@@ -253,7 +277,7 @@ class TransNetV2Torch:
                 print(f"\n[Error] extracting frame {frame_idx}: {e}")
                 continue
         
-        print(f"\n[TransNetV2] Completed! Keyframes saved to {output_dir}")
+        print(f"\n[TransNetV2] Keyframe extraction completed!")
 
     @staticmethod
     def calculate_720p_resolution(original_width, original_height):
@@ -282,6 +306,62 @@ class TransNetV2Torch:
             target_width += 1
             
         return target_width, target_height, True
+
+    @staticmethod
+    def preprocess_video_to_720p(video_path: str, output_path: str):
+        """
+        Pre-process video to 720p resolution for faster keyframe extraction
+        
+        Args:
+            video_path: Path to original video
+            output_path: Path to save 720p video
+            
+        Returns:
+            tuple: (processed_video_path, target_width, target_height, needs_processing)
+        """
+        import tempfile
+        
+        try:
+            # Get video info
+            probe = ffmpeg.probe(video_path)
+            video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+            original_width = int(video_info['width'])
+            original_height = int(video_info['height'])
+            
+            # Check if processing is needed
+            target_width, target_height, needs_scaling = TransNetV2Torch.calculate_720p_resolution(
+                original_width, original_height
+            )
+            
+            if not needs_scaling:
+                print(f"[TransNetV2] Video already 720p or smaller ({original_width}x{original_height}), using original")
+                return video_path, original_width, original_height, False
+            
+            # Create temporary 720p video
+            print(f"[TransNetV2] Pre-processing video: {original_width}x{original_height} → {target_width}x{target_height}")
+            
+            # Fast video processing with hardware acceleration if available
+            stream = ffmpeg.input(video_path)
+            stream = ffmpeg.output(
+                stream, 
+                output_path,
+                vcodec='libx264',  # Fast encoder
+                crf=23,  # Good quality/speed balance
+                preset='fast',  # Fast encoding preset
+                s=f"{target_width}x{target_height}",
+                sws_flags="bilinear",  # Fast scaling
+                y=None  # Overwrite if exists
+            )
+            
+            ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, quiet=True)
+            
+            print(f"[TransNetV2] Video pre-processing completed: {output_path}")
+            return output_path, target_width, target_height, True
+            
+        except Exception as e:
+            print(f"[Error] Video pre-processing failed: {e}")
+            # Return original video if processing fails
+            return video_path, original_width, original_height, False
 
 
 # ------------------------------------------------------------------------------
