@@ -13,7 +13,7 @@ from transnetv2_pytorch.model import TransNetV2
 class TransNetV2Torch:
     def __init__(self):
         self._input_size = (27, 48, 3)
-        # assume the weights are located in the same directory as this script
+        # assumeC the weights are located in the same directory as this script
         weights_path = os.path.join(os.path.dirname(__file__),
                                     'transnetv2-pytorch-weights.pth')
         self.model = TransNetV2()
@@ -147,12 +147,16 @@ class TransNetV2Torch:
     @staticmethod
     def save_keyframes_to_folder(video_path: str, keyframe_indices, output_dir):
         """
-        Extract keyframes and save to specific folder with safe frame extraction
+        Extract keyframes and save to specific folder with 720p resolution scaling
         
         Args:
             video_path: Path to original video
             keyframe_indices: List of frame indices to extract
             output_dir: Directory to save keyframes
+            
+        Note:
+            - Keyframes are automatically scaled to 720p while maintaining aspect ratio
+            - Output format: JPG files named as frame_index (e.g., 000123.jpg)
         """
         import os
         
@@ -165,20 +169,30 @@ class TransNetV2Torch:
         try:
             probe = ffmpeg.probe(video_path)
             video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
-            width = int(video_info['width'])
-            height = int(video_info['height'])
+            original_width = int(video_info['width'])
+            original_height = int(video_info['height'])
+            
+            # Calculate target resolution (720p scaling)
+            target_width, target_height, needs_scaling = TransNetV2Torch.calculate_720p_resolution(
+                original_width, original_height
+            )
             
             # Calculate total frames
             fps = eval(video_info['r_frame_rate'])  # Convert "25/1" to 25.0
             duration = float(video_info['duration'])
             total_frames = int(fps * duration)
             
-            print(f"[TransNetV2] Video info: {width}x{height}, {fps:.2f} FPS, {total_frames} frames")
+            if needs_scaling:
+                print(f"[TransNetV2] Video info: {original_width}x{original_height} → {target_width}x{target_height}, {fps:.2f} FPS, {total_frames} frames")
+            else:
+                print(f"[TransNetV2] Video info: {original_width}x{original_height} (no scaling needed), {fps:.2f} FPS, {total_frames} frames")
             
         except Exception as e:
             print(f"Error getting video info: {e}")
             fps = 25.0  # Default FPS
             total_frames = None
+            target_width, target_height = 1280, 720  # Default 720p
+            needs_scaling = True  # Assume scaling is needed by default
         
         for i, frame_idx in enumerate(keyframe_indices):
             try:
@@ -190,33 +204,48 @@ class TransNetV2Torch:
                 # Calculate timestamp
                 timestamp = frame_idx / fps
                 
-                # Extract single frame at original resolution using timestamp
-                video_stream, _ = ffmpeg.input(video_path, ss=timestamp).output(
-                    "pipe:", vframes=1, format="rawvideo", pix_fmt="rgb24"
-                ).run(capture_stdout=True, capture_stderr=True, quiet=True)
+                # Extract single frame with conditional scaling for optimal performance
+                if needs_scaling:
+                    # Scale down to 720p using fast bilinear interpolation
+                    video_stream, _ = ffmpeg.input(video_path, ss=timestamp).output(
+                        "pipe:", 
+                        vframes=1, 
+                        format="rawvideo", 
+                        pix_fmt="rgb24",
+                        s=f"{target_width}x{target_height}",
+                        sws_flags="bilinear"  # Fast scaling algorithm
+                    ).run(capture_stdout=True, capture_stderr=True, quiet=True)
+                else:
+                    # Extract at original resolution (no scaling needed)
+                    video_stream, _ = ffmpeg.input(video_path, ss=timestamp).output(
+                        "pipe:", 
+                        vframes=1, 
+                        format="rawvideo", 
+                        pix_fmt="rgb24"
+                    ).run(capture_stdout=True, capture_stderr=True, quiet=True)
                 
                 # Check if we got data
                 if len(video_stream) == 0:
                     print(f"\n[Warning] No data for frame {frame_idx} at timestamp {timestamp:.2f}s, skipping")
                     continue
                 
-                # Calculate expected size
-                expected_size = width * height * 3
+                # Calculate expected size for target resolution
+                expected_size = target_width * target_height * 3
                 if len(video_stream) != expected_size:
                     print(f"\n[Warning] Frame {frame_idx}: expected {expected_size} bytes, got {len(video_stream)}, skipping")
                     continue
                 
-                # Reshape frame
-                frame_array = np.frombuffer(video_stream, np.uint8).reshape([height, width, 3])
+                # Reshape frame using target resolution
+                frame_array = np.frombuffer(video_stream, np.uint8).reshape([target_height, target_width, 3])
                 
-                # Convert to PIL Image and save
+                # Convert to PIL Image and save as JPG
                 from PIL import Image
                 img = Image.fromarray(frame_array)
                 
-                # Generate filename: <frame_idx>.png
-                filename = f"{frame_idx:06d}.png"
+                # Generate filename: <frame_idx>.jpg
+                filename = f"{frame_idx:06d}.jpg"
                 filepath = os.path.join(output_dir, filename)
-                img.save(filepath, quality=95)
+                img.save(filepath, 'JPEG', quality=95, optimize=True)
                 
                 print(f"\r[TransNetV2] Saved: {filename} ({i+1}/{len(keyframe_indices)})", end="")
                 
@@ -225,6 +254,34 @@ class TransNetV2Torch:
                 continue
         
         print(f"\n[TransNetV2] Completed! Keyframes saved to {output_dir}")
+
+    @staticmethod
+    def calculate_720p_resolution(original_width, original_height):
+        """
+        Calculate target resolution to scale video to 720p while maintaining aspect ratio
+        Only scales down if original resolution is higher than 720p
+        
+        Args:
+            original_width: Original video width
+            original_height: Original video height
+            
+        Returns:
+            tuple: (target_width, target_height, needs_scaling) for 720p scaling
+        """
+        # If video is already 720p or smaller, don't scale
+        if original_height <= 720:
+            return original_width, original_height, False
+            
+        # Scale down to 720p
+        target_height = 720
+        aspect_ratio = original_width / original_height
+        target_width = int(target_height * aspect_ratio)
+        
+        # Ensure width is even (required for some video encoders)
+        if target_width % 2 != 0:
+            target_width += 1
+            
+        return target_width, target_height, True
 
 
 # ------------------------------------------------------------------------------
@@ -237,6 +294,8 @@ def main():
                         help="directory to save keyframes")
     parser.add_argument("--shot-threshold", type=float, default=0.35,
                         help="threshold for scene detection (default: 0.35)")
+    parser.add_argument("--filter-range", type=str, default=None,
+                        help="filter videos by number range (e.g., '08-10' for videos 08, 09, 10)")
     args = parser.parse_args()
 
     model = TransNetV2Torch()
